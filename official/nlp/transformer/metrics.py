@@ -138,19 +138,20 @@ class MetricLayer(tf.keras.layers.Layer):
     super(MetricLayer, self).__init__()
     self.vocab_size = vocab_size
     self.metric_mean_fns = []
+    self.n_sentences = tf.keras.metrics.Sum("n_sentences")
 
-  def build(self, input_shape):
-    """"Builds metric layer."""
-    neg_log_perplexity = functools.partial(
-        padded_neg_log_perplexity, vocab_size=self.vocab_size)
-    self.metric_mean_fns = [
-        (tf.keras.metrics.Mean("accuracy"), padded_accuracy),
-        (tf.keras.metrics.Mean("accuracy_top5"), padded_accuracy_top5),
-        (tf.keras.metrics.Mean("accuracy_per_sequence"),
-         padded_sequence_accuracy),
-        (tf.keras.metrics.Mean("neg_log_perplexity"), neg_log_perplexity),
-    ]
-    super(MetricLayer, self).build(input_shape)
+  # def build(self, input_shape):
+  #   """"Builds metric layer."""
+  #   neg_log_perplexity = functools.partial(
+  #       padded_neg_log_perplexity, vocab_size=self.vocab_size)
+  #   self.metric_mean_fns = [
+  #       (tf.keras.metrics.Mean("accuracy"), padded_accuracy),
+  #       (tf.keras.metrics.Mean("accuracy_top5"), padded_accuracy_top5),
+  #       (tf.keras.metrics.Mean("accuracy_per_sequence"),
+  #        padded_sequence_accuracy),
+  #       (tf.keras.metrics.Mean("neg_log_perplexity"), neg_log_perplexity),
+  #   ]
+  #   super(MetricLayer, self).build(input_shape)
 
   def get_config(self):
     return {"vocab_size": self.vocab_size}
@@ -160,6 +161,8 @@ class MetricLayer(tf.keras.layers.Layer):
     for mean, fn in self.metric_mean_fns:
       m = mean(*fn(logits, targets))
       self.add_metric(m)
+
+    self.add_metric(self.n_sentences(tf.shape(logits)[0]))
     return logits
 
 

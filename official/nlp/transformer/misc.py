@@ -16,6 +16,7 @@
 
 # pylint: disable=g-bad-import-order
 
+import os
 from absl import flags
 import tensorflow as tf
 
@@ -68,6 +69,21 @@ def define_transformer_flags():
   flags_core.define_benchmark()
   flags_core.define_device(tpu=True)
 
+  flags.DEFINE_string(
+      name='task',
+      default=None,
+      help=flags_core.help_wrap('')
+      )
+  flags.DEFINE_string(
+      name='wiki_dir',
+      default=None,
+      help=flags_core.help_wrap('')
+      )
+  flags.DEFINE_string(
+      name='baidu_dir',
+      default=None,
+      help=flags_core.help_wrap('')
+      )
   flags.DEFINE_integer(
       name='train_steps',
       short_name='ts',
@@ -80,14 +96,27 @@ def define_transformer_flags():
       help=flags_core.help_wrap(
           'The Number of training steps to run between evaluations. This is '
           'used if --train_steps is defined.'))
+  flags.DEFINE_integer(
+      name='early_stopping',
+      default=None,
+      help=flags_core.help_wrap(
+          "The Number of consecutive runs for which the validation performance hasn't improved."
+          "Early stopping if the model has no progress for this number of runs."
+          ))
   flags.DEFINE_boolean(
       name='enable_time_history',
       default=True,
-      help='Whether to enable TimeHistory callback.')
-  flags.DEFINE_boolean(
+      help='Whether to enable TimeHistory callback.'
+      'If so, --log_steps must be specified.'
+      )
+  flags.DEFINE_integer(
       name='enable_tensorboard',
-      default=False,
-      help='Whether to enable Tensorboard callback.')
+      default=0,
+      help=(
+        'Whether to enable Tensorboard callback.'
+        "if 0, disable Tensorboard."
+        "if > 0, enable Tensorboard and set as the update frequency.")
+        )
   flags.DEFINE_boolean(
       name='enable_metrics_in_training',
       default=False,
@@ -100,6 +129,16 @@ def define_transformer_flags():
   # the '-h' flag is used. Without this line, the flags defined above are
   # only shown in the full `--helpful` help text.
   flags.adopt_module_key_flags(flags_core)
+  
+  # Add noise
+  flags.DEFINE_float(
+      name='word_dropout',
+      default=0.1,
+      help=flags_core.help_wrap(""))
+  flags.DEFINE_float(
+      name='word_blank',
+      default=0.15,
+      help=flags_core.help_wrap(""))
 
   # Add transformer-specific flags
   flags.DEFINE_enum(
@@ -134,6 +173,10 @@ def define_transformer_flags():
           'Max sentence length for Transformer. Default is 256. Note: Usually '
           'it is more effective to use a smaller max length if static_batch is '
           'enabled, e.g. 64.'))
+  flags.DEFINE_integer(
+      name='min_length',
+      default=1,
+      help=flags_core.help_wrap('Max sentence length for Transformer.'))
 
   # Flags for training with steps (may be used for debugging)
   flags.DEFINE_integer(
@@ -238,6 +281,102 @@ def define_transformer_flags():
 
   # pylint: enable=unused-variable
 
+class TensorBoardCallback(tf.keras.callbacks.TensorBoard):
+  """ Inherit tf.keras.callbacks.TensorBoard to add best metrics recording. """
+
+  def __init__(self, monitor_dict=None, **kwargs):
+    super().__init__(**kwargs)
+    self.monitor_dict = monitor_dict
+    self.best_scores = {
+      name: float("inf") if mode == "min" else 0
+      for name, mode in monitor_dict.items()
+    }
+
+  def update_best_scores(self, logs):
+
+    def better(a, b, mode):
+      return a < b if mode == "min" else a > b
+
+    self.best_scores = {
+      name: (logs[name]
+      if name in logs and better(logs[name], self.best_scores[name], mode)
+      else self.best_scores[name]
+      )
+      for name, mode in self.monitor_dict.items()
+    }
+
+  def on_epoch_end(self, epoch, logs=None):
+    """Runs metrics and histogram summaries at epoch end."""
+    self.update_best_scores(logs)
+    self._log_epoch_metrics(epoch, logs)
+
+    if self.histogram_freq and epoch % self.histogram_freq == 0:
+      self._log_weights(epoch)
+
+    if self.embeddings_freq and epoch % self.embeddings_freq == 0:
+      self._log_embeddings(epoch)
+
+  def on_test_end(self, logs=None):
+    val_logs = {'val_' + name: val for name, val in logs.items()}
+    self.update_best_scores(val_logs)
+
+    if self.model.optimizer and hasattr(self.model.optimizer, 'iterations'):
+      with tf.summary.record_if(True), self._val_writer.as_default():
+        for name, value in logs.items():
+          tf.summary.scalar(
+              'evaluation_' + name + '_vs_iterations',
+              value,
+              step=self.model.optimizer.iterations.read_value())
+          val_name = f"val_{name}"
+          if val_name in self.best_scores:
+            tf.summary.scalar(
+                'best_evaluation_' + name + '_vs_iterations',
+                self.best_scores[val_name],
+                step=self.model.optimizer.iterations.read_value())
+    self._pop_writer()
+
+  def _log_epoch_metrics(self, epoch, logs):
+    """Writes epoch metrics out as scalar summaries.
+    Args:
+        epoch: Int. The global step to use for TensorBoard.
+        logs: Dict. Keys are scalar summary names, values are scalars.
+    """
+    if not logs:
+      return
+
+    train_logs = {k: v for k, v in logs.items() if not k.startswith('val_')}
+    val_logs = {k: v for k, v in logs.items() if k.startswith('val_')}
+    train_logs = self._collect_learning_rate(train_logs)
+    if self.write_steps_per_second:
+      train_logs['steps_per_second'] = self._compute_steps_per_second()
+    epoch += 1
+
+    with tf.summary.record_if(True):
+      if train_logs:
+        with self._train_writer.as_default():
+          for name, value in train_logs.items():
+            tf.summary.scalar('epoch_' + name, value, step=epoch)
+            if name in self.best_scores:
+              tf.summary.scalar('best_epoch_' + name, self.best_scores[name], step=epoch)
+
+      if val_logs:
+        with self._val_writer.as_default():
+          for name, value in val_logs.items():
+            val_name = name
+            name = name[4:]  # Remove 'val_' prefix.
+            tf.summary.scalar('epoch_' + name, value, step=epoch)
+            if val_name in self.best_scores:
+              tf.summary.scalar('best_epoch_' + name, self.best_scores[val_name], step=epoch)
+
+class BackupCallback(tf.keras.callbacks.experimental.BackupAndRestore):
+  def on_train_end(self, logs=None):
+    """ Override this function for not deleting the backup in the end. """
+
+    # self._training_state.delete_backup()
+
+    # Clean up the training state.
+    del self._training_state
+    del self.model._training_state
 
 def get_callbacks():
   """Returns common callbacks."""
@@ -250,9 +389,24 @@ def get_callbacks():
     callbacks.append(time_callback)
 
   if FLAGS.enable_tensorboard:
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(
-        log_dir=FLAGS.model_dir)
+    monitor_dict = {
+      "val_loss": "min"
+    }
+    tensorboard_callback = TensorBoardCallback(log_dir=FLAGS.model_dir, update_freq=FLAGS.enable_tensorboard, monitor_dict=monitor_dict)
     callbacks.append(tensorboard_callback)
+    
+  if FLAGS.enable_checkpointing:
+    ckpt_dir = os.path.join(FLAGS.model_dir, "checkpoints")
+    best_ckpt_path = os.path.join(ckpt_dir, "best.ckpt")
+    callbacks.extend([
+        tf.keras.callbacks.ModelCheckpoint(best_ckpt_path, monitor='val_loss', verbose=1, save_best_only=True, save_weights_only=FLAGS.save_weights_only),
+        BackupCallback(backup_dir=ckpt_dir)
+    ]
+        )
+
+  if FLAGS.early_stopping is not None:
+    early_stopping_callback = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=FLAGS.early_stopping, verbose=1)
+    callbacks.append(early_stopping_callback)
 
   return callbacks
 

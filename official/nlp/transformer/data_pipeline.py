@@ -47,7 +47,7 @@ Two things to note in the pipeline:
    in the order of the examples.
 """
 
-import os
+import os, numpy as np
 
 from absl import logging
 import tensorflow as tf
@@ -58,15 +58,18 @@ from official.utils.misc import model_helpers
 # 7.2 MB, so 8 MB allows an entire file to be kept in memory.
 _READ_RECORD_BUFFER = 8 * 1000 * 1000
 
+# 7.2 MB, so 8 MB allows an entire file to be kept in memory.
+ETST_READ_RECORD_BUFFER = 16 * 1000 * 1000
+
 # Example grouping constants. Defines length boundaries for each group.
 # These values are the defaults used in Tensor2Tensor.
 _MIN_BOUNDARY = 8
 _BOUNDARY_SCALE = 1.1
 
 
-def _load_records(filename):
+def _load_records(filename, buffer_size):
   """Read file and return a dataset of tf.Examples."""
-  return tf.data.TFRecordDataset(filename, buffer_size=_READ_RECORD_BUFFER)
+  return tf.data.TFRecordDataset(filename, buffer_size=buffer_size)
 
 
 def _parse_example(serialized_example):
@@ -79,14 +82,101 @@ def _parse_example(serialized_example):
   inputs = tf.sparse.to_dense(parsed["inputs"])
   targets = tf.sparse.to_dense(parsed["targets"])
   return inputs, targets
+  
+def ETST_parse_example(serialized_example):
+  """Return inputs Tensors from a serialized tf.Example."""
+  data_fields = {
+      "inputs": tf.io.VarLenFeature(tf.int64)
+  }
+  parsed = tf.io.parse_single_example(serialized_example, data_fields)
+  inputs = tf.sparse.to_dense(parsed["inputs"])
 
+  return inputs
+
+def add_noise(input, vocab, params):
+  """
+  Add noise to the encoder input.
+  """
+
+  def word_shuffle(x):
+      """
+      Randomly shuffle input words.
+      """
+
+      # define noise word scores
+      scores = tf.random.uniform(tf.shape(x))
+
+      # generate a random permutation
+      permutation = tf.argsort(scores)
+
+      # shuffle words
+      x = tf.gather(x, indices=permutation)
+
+      return x
+
+  def word_dropout(x):
+      """
+      Randomly drop input words.
+      """
+      if params["word_dropout"] == 0:
+          return x
+      assert 0 < params["word_dropout"] < 1
+      
+      # define words to drop
+      keep = tf.random.uniform(tf.shape(x)) >= params["word_dropout"]
+      
+      return x[keep]
+
+  def word_blank(x):
+      """
+      Randomly blank input words.
+      """
+      if params["word_blank"] == 0:
+          return x
+      assert 0 < params["word_blank"] < 1
+
+      shape = tf.shape(x)
+
+      # define words to blank
+      keep = tf.random.uniform(shape) >= params["word_blank"]
+      p_mask = 0.8
+      mask = tf.random.uniform(shape) < p_mask
+
+      rand_token = tf.random.uniform(shape=shape, minval=vocab.n_special_words, maxval=len(vocab), dtype=x.dtype)
+      mask_index = tf.cast(vocab.mask_index, dtype=rand_token.dtype)
+      replacement = tf.where(mask, x=mask_index, y=rand_token)
+      x = tf.where(keep, x=x, y=replacement)
+      
+      return x
+      
+  target = tf.identity(input)
+  # input = word_shuffle(input)
+  input = word_dropout(input)
+  input = word_blank(input)
+  return input, target
+
+def add_bos_eos(x, vocab):
+    length = tf.size(x)
+
+    # Create a tensor containing <BOS> and <EOS>.
+    t = tf.scatter_nd(
+      [[0], [length + 1]],
+      [vocab.bos_index, vocab.eos_index],
+      [length + 2]
+      )
+    t = tf.cast(t, dtype=x.dtype)
+      
+    # Fill in the input
+    idx = tf.expand_dims(tf.range(1, 1 + length), axis=-1)
+    x = tf.tensor_scatter_nd_update(t, idx, x)
+    
+    return x
 
 def _filter_max_length(example, max_length=256):
   """Indicates whether the example's length is lower than the maximum length."""
   return tf.logical_and(
       tf.size(example[0]) <= max_length,
       tf.size(example[1]) <= max_length)
-
 
 def _get_example_length(example):
   """Returns the maximum length between the example inputs and targets."""
@@ -237,7 +327,7 @@ def _read_and_batch_from_files(file_pattern,
   options = tf.data.Options()
   options.experimental_deterministic = False
   dataset = dataset.interleave(
-      _load_records,
+      lambda filename: _load_records(filename, _READ_RECORD_BUFFER),
       cycle_length=max_io_parallelism,
       num_parallel_calls=tf.data.experimental.AUTOTUNE).with_options(options)
 
@@ -247,6 +337,107 @@ def _read_and_batch_from_files(file_pattern,
       _parse_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
   # Remove examples where the input or target length exceeds the maximum length,
+  dataset = dataset.filter(lambda x, y: _filter_max_length((x, y), max_length))
+
+  if static_batch:
+    dataset = dataset.padded_batch(
+        # First calculate batch size (token number) per worker, then divide it
+        # into sentences, and finally expand to a global batch. It could prove
+        # the global batch divisble for distribution strategy.
+        int(batch_size // num_replicas // max_length * num_replicas),
+        ([max_length], [max_length]),
+        drop_remainder=True)
+  else:
+    # Group and batch such that each batch has examples of similar length.
+    # TODO(xunkai): _batch_examples might need to do something special for
+    # num_replicas.
+    dataset = _batch_examples(dataset, batch_size, max_length)
+
+  dataset = dataset.repeat(repeat)
+
+  # Prefetch the next element to improve speed of input pipeline.
+  dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+  return dataset
+  
+def ETST_read_and_batch_from_files(
+  file_pattern1, file_pattern2,
+  vocab,
+  batch_size,
+  max_length,
+  max_io_parallelism,
+  shuffle,
+  repeat,
+  static_batch=False,
+  num_replicas=1,
+  ctx=None,
+  params=None
+  ):
+  """Create dataset where each item is a dict of "inputs" and "targets".
+
+  Args:
+    file_pattern: String used to match the input TFRecord files.
+    batch_size: Maximum number of tokens per global batch of examples.
+    max_length: Maximum number of tokens per example
+    max_io_parallelism: Max number of cpu cores for parallel input processing.
+    shuffle: If true, randomizes order of elements.
+    repeat: Number of times to repeat the dataset. If None, the dataset is
+      repeated forever.
+    static_batch: Whether the batches in the dataset should have static shapes.
+      If True, the input is batched so that every batch has the shape
+      [batch_size // max_length, max_length]. If False, the input is grouped by
+      length, and batched so that batches may have different
+      shapes [N, M], where: N * M <= batch_size M <= max_length In general, this
+        setting should be False. Dynamic shapes allow the inputs to be grouped
+        so that the number of padding tokens is minimized, and helps model
+        training. In cases where the input shape must be static (e.g. running on
+        TPU), this setting should be set to True.
+    num_replicas: Number of GPUs or other workers. We will generate global
+      batches, and each global batch is equally divisible by number of replicas.
+      Currently it is only effective when static_batch==True. TODO: make it
+        effective when static_batch=False.
+    ctx: Input context.
+
+  Returns:
+    tf.data.Dataset object containing examples loaded from the files.
+  """
+  dataset1 = tf.data.Dataset.list_files(file_pattern1)
+  dataset2 = tf.data.Dataset.list_files(file_pattern2)
+  dataset = dataset1.concatenate(dataset2)
+
+  if shuffle:
+    dataset = dataset.shuffle(buffer_size=len(dataset))
+
+  if ctx and ctx.num_input_pipelines > 1:
+    logging.info("Shard %d of the dataset.", ctx.input_pipeline_id)
+    dataset = dataset.shard(ctx.num_input_pipelines, ctx.input_pipeline_id)
+
+  # Read files and interleave results. When training, the order of the examples
+  # will be non-deterministic.
+  options = tf.data.Options()
+  options.experimental_deterministic = False
+  dataset = dataset.interleave(
+      lambda filename: _load_records(filename, ETST_READ_RECORD_BUFFER),
+      cycle_length=max_io_parallelism,
+      num_parallel_calls=tf.data.experimental.AUTOTUNE).with_options(options)
+
+  # Parse each tf.Example into a dictionary
+  # TODO: Look into prefetch_input_elements for performance optimization.  # pylint: disable=g-bad-todo
+  dataset = dataset.map(
+      ETST_parse_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+  # Transform the data to (input, target) pairs and add some noise to the inputs.
+  dataset = dataset.map(
+      lambda input: add_noise(input, vocab, params),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE
+      )
+
+  # Transform the data to (input, target) pairs and add some noise to the inputs.
+  dataset = dataset.map(
+      lambda x, y: (add_bos_eos(x, vocab), add_bos_eos(y, vocab)),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE
+      )
+
+  # Remove examples where the input or target length exceeds the maximum length.
   dataset = dataset.filter(lambda x, y: _filter_max_length((x, y), max_length))
 
   if static_batch:
@@ -321,6 +512,53 @@ def eval_input_fn(params, ctx=None):
       static_batch=params["static_batch"],
       num_replicas=params["num_gpus"],
       ctx=ctx)
+
+def ETST_train_input_fn(params, vocab, ctx=None):
+  """Load and return dataset of batched examples for use during training."""
+  file_pattern1, file_pattern2 = (
+    os.path.join(params["wiki_dir"] or "", "*train*"),
+    os.path.join(params["baidu_dir"] or "", "*train*")
+  )
+  if params["use_synthetic_data"]:
+    return _generate_synthetic_data(params)
+  return ETST_read_and_batch_from_files(
+      file_pattern1, file_pattern2,
+      vocab,
+      params["batch_size"],
+      params["max_length"],
+      params["max_io_parallelism"],
+      shuffle=True,
+      repeat=params["repeat_dataset"],
+      static_batch=params["static_batch"],
+      num_replicas=params["num_gpus"],
+      ctx=ctx,
+      params=params
+      )
+
+
+def ETST_eval_input_fn(params, vocab, ctx=None):
+  """Load and return dataset of batched examples for use during evaluation."""
+  file_pattern1, file_pattern2 = (
+    os.path.join(params["wiki_dir"] or "", "*dev*"),
+    os.path.join(params["baidu_dir"] or "", "*dev*")
+  )
+  if params["use_synthetic_data"]:
+    return _generate_synthetic_data(params)
+  valid_set = ETST_read_and_batch_from_files(
+      file_pattern1, file_pattern2,
+      vocab,
+      params["batch_size"],
+      params["max_length"],
+      params["max_io_parallelism"],
+      shuffle=False,
+      repeat=1,
+      static_batch=params["static_batch"],
+      num_replicas=params["num_gpus"],
+      ctx=ctx,
+      params=params
+      )
+
+  return valid_set.cache()
 
 
 def map_data_for_transformer_fn(x, y):

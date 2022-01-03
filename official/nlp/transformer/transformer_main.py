@@ -39,6 +39,13 @@ from official.nlp.transformer.utils import tokenizer
 from official.utils.flags import core as flags_core
 from official.utils.misc import keras_utils
 # pylint:disable=logging-format-interpolation
+from official.nlp.transformer.utils.others import from_path_import
+
+# from dictionary import Dictionary
+name = "dictionary"
+path = "/home/zchen/encyclopedia-text-style-transfer/dictionary.py"
+demands = ["Dictionary"]
+from_path_import(name, path, globals(), demands)
 
 INF = int(1e9)
 BLEU_DIR = "bleu"
@@ -140,6 +147,8 @@ class TransformerTask(object):
     params["num_gpus"] = num_gpus
     params["use_ctl"] = flags_obj.use_ctl
     params["data_dir"] = flags_obj.data_dir
+    params["wiki_dir"] = flags_obj.wiki_dir
+    params["baidu_dir"] = flags_obj.baidu_dir
     params["model_dir"] = flags_obj.model_dir
     params["static_batch"] = flags_obj.static_batch
     params["max_length"] = flags_obj.max_length
@@ -159,6 +168,13 @@ class TransformerTask(object):
     params["enable_checkpointing"] = flags_obj.enable_checkpointing
     params["save_weights_only"] = flags_obj.save_weights_only
 
+    # Add noise
+    params["word_dropout"] = flags_obj.word_dropout
+    params["word_blank"] = flags_obj.word_blank
+    
+    self.vocab = Dictionary.read_vocab(flags_obj.vocab_file)
+    params["vocab_size"] = len(self.vocab)
+
     self.distribution_strategy = distribute_utils.get_distribution_strategy(
         distribution_strategy=flags_obj.distribution_strategy,
         num_gpus=num_gpus,
@@ -177,7 +193,7 @@ class TransformerTask(object):
       logging.info("Not using any distribution strategy.")
 
     performance.set_mixed_precision_policy(params["dtype"])
-
+    
   @property
   def use_tpu(self):
     if self.distribution_strategy:
@@ -229,14 +245,25 @@ class TransformerTask(object):
           self.distribution_strategy.distribute_datasets_from_function(
               lambda ctx: data_pipeline.train_input_fn(params, ctx)))
     else:
-      train_ds = data_pipeline.train_input_fn(params)
+      if flags_obj.task == "ETST":
+        train_ds, valid_ds = (
+          data_pipeline.ETST_train_input_fn(params, self.vocab),
+          data_pipeline.ETST_eval_input_fn(params, self.vocab)
+        )
+      else:
+        train_ds, valid_ds = (
+          data_pipeline.train_input_fn(params),
+          data_pipeline.eval_input_fn(params)
+        )
       map_data_fn = data_pipeline.map_data_for_transformer_fn
-      train_ds = train_ds.map(
-          map_data_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      train_ds, valid_ds = (
+          train_ds.map(map_data_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE),
+          valid_ds.map(map_data_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      )
     if params["use_ctl"]:
       train_ds_iterator = iter(train_ds)
 
-    callbacks = self._create_callbacks(flags_obj.model_dir, params)
+    callbacks = misc.get_callbacks()
 
     # Only TimeHistory callback is supported for CTL
     if params["use_ctl"]:
@@ -279,19 +306,20 @@ class TransformerTask(object):
         self.distribution_strategy.run(
             _step_fn, args=(next(iterator),))
 
-    cased_score, uncased_score = None, None
-    cased_score_history, uncased_score_history = [], []
-    while current_step < flags_obj.train_steps:
-      remaining_steps = flags_obj.train_steps - current_step
-      train_steps_per_eval = (
-          remaining_steps if remaining_steps < flags_obj.steps_between_evals
-          else flags_obj.steps_between_evals)
-      current_iteration = current_step // flags_obj.steps_between_evals
+    if params["use_ctl"]:
+      cased_score, uncased_score = None, None
+      cased_score_history, uncased_score_history = [], []
+      best_loss, not_improving = float("inf"), 0
+      while current_step < flags_obj.train_steps:
+        remaining_steps = flags_obj.train_steps - current_step
+        train_steps_per_eval = (
+            remaining_steps if remaining_steps < flags_obj.steps_between_evals
+            else flags_obj.steps_between_evals)
+        current_iteration = current_step // flags_obj.steps_between_evals
 
-      logging.info(
-          "Start train iteration at global step:{}".format(current_step))
-      history = None
-      if params["use_ctl"]:
+        logging.info(
+            "Start train iteration at global step:{}".format(current_step))
+        history = None
         if not self.use_tpu:
           raise NotImplementedError(
               "Custom training loop on GPUs is not implemented.")
@@ -329,34 +357,31 @@ class TransformerTask(object):
               os.path.join(flags_obj.model_dir,
                            "ctl_step_{}.ckpt".format(current_step)))
           logging.info("Saved checkpoint to %s", checkpoint_name)
-      else:
-        if self.use_tpu:
-          raise NotImplementedError(
-              "Keras model.fit on TPUs is not implemented.")
-        history = model.fit(
-            train_ds,
-            initial_epoch=current_iteration,
-            epochs=current_iteration + 1,
-            steps_per_epoch=train_steps_per_eval,
-            callbacks=callbacks,
-            # If TimeHistory is enabled, progress bar would be messy. Increase
-            # the verbose level to get rid of it.
-            verbose=(2 if flags_obj.enable_time_history else 1))
-        current_step += train_steps_per_eval
-        logging.info("Train history: {}".format(history.history))
 
-      logging.info("End train iteration at global step:{}".format(current_step))
+        logging.info("End train iteration at global step:{}".format(current_step))
 
-      if (flags_obj.bleu_source and flags_obj.bleu_ref):
-        uncased_score, cased_score = self.eval()
-        cased_score_history.append([current_iteration + 1, cased_score])
-        uncased_score_history.append([current_iteration + 1, uncased_score])
+        if (flags_obj.bleu_source and flags_obj.bleu_ref):
+          uncased_score, cased_score = self.eval()
+          cased_score_history.append([current_iteration + 1, cased_score])
+          uncased_score_history.append([current_iteration + 1, uncased_score])
+    else:
+      if self.use_tpu:
+        raise NotImplementedError(
+            "Keras model.fit on TPUs is not implemented.")
+      history = model.fit(
+          train_ds, validation_data=valid_ds,
+          epochs=flags_obj.train_steps // params["steps_between_evals"] + 1,
+          steps_per_epoch=params["steps_between_evals"],
+          callbacks=callbacks,
+          # If TimeHistory is enabled, progress bar would be messy. Increase
+          # the verbose level to get rid of it.
+          verbose=(2 if flags_obj.enable_time_history else 1))
 
     stats = ({
         "loss": train_loss
     } if history is None else {})
     misc.update_stats(history, stats, callbacks)
-    if uncased_score and cased_score:
+    if flags_obj.bleu_source and flags_obj.bleu_ref:
       stats["bleu_uncased"] = uncased_score
       stats["bleu_cased"] = cased_score
       stats["bleu_uncased_history"] = uncased_score_history
@@ -401,16 +426,6 @@ class TransformerTask(object):
     length = len(val_outputs)
     for i in range(length):
       translate.translate_from_input(val_outputs[i], subtokenizer)
-
-  def _create_callbacks(self, cur_log_dir, params):
-    """Creates a list of callbacks."""
-    callbacks = misc.get_callbacks()
-    if params["enable_checkpointing"]:
-      ckpt_full_path = os.path.join(cur_log_dir, "cp-{epoch:04d}.ckpt")
-      callbacks.append(
-          tf.keras.callbacks.ModelCheckpoint(
-              ckpt_full_path, save_weights_only=params["save_weights_only"]))
-    return callbacks
 
   def _load_weights_if_possible(self, model, init_weight_path=None):
     """Loads model weights when it is provided."""
@@ -457,6 +472,13 @@ def main(_):
   if flags_obj.enable_mlir_bridge:
     tf.config.experimental.enable_mlir_bridge()
   task = TransformerTask(flags_obj)
+
+  # # set the logging directory
+  # log_dir = os.path.join(flags_obj.model_dir, 'log')
+  # if not os.path.exists(log_dir):
+  #     os.makedirs(log_dir)
+  # flags_obj.log_dir = log_dir
+  # logging.get_absl_handler().use_absl_log_file()
 
   # Execute flag override logic for better model performance
   if flags_obj.tf_gpu_thread_mode:
