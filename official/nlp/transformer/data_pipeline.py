@@ -145,9 +145,8 @@ def add_noise(input, vocab, params):
       rand_token = tf.random.uniform(shape=shape, minval=vocab.n_special_words, maxval=len(vocab), dtype=x.dtype)
       mask_index = tf.cast(vocab.mask_index, dtype=rand_token.dtype)
       replacement = tf.where(mask, x=mask_index, y=rand_token)
-      x = tf.where(keep, x=x, y=replacement)
       
-      return x
+      return tf.where(keep, x=x, y=replacement)
       
   target = tf.identity(input)
   # input = word_shuffle(input)
