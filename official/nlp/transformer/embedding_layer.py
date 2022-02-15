@@ -66,6 +66,8 @@ class EmbeddingSharedWeights(tf.keras.layers.Layer):
     """
     if mode == "embedding":
       return self._embedding(inputs)
+    elif mode == "soft_seq":
+      return self._weighted_sum(inputs)
     elif mode == "linear":
       return self._linear(inputs)
     else:
@@ -82,6 +84,18 @@ class EmbeddingSharedWeights(tf.keras.layers.Layer):
       embeddings *= self.hidden_size**0.5
 
       return embeddings
+
+  def _weighted_sum(self, inputs):
+    """Applies embedding based on inputs tensor which is probabilitiy distribution of a word.
+
+    Args:
+      inputs: A float32 tensor with shape [batch_size, length, vocab_size]
+
+    Returns:
+      float32 tensor with shape [batch_size, length, hidden_size].
+    """
+
+    return inputs @ self.shared_weights
 
   def _linear(self, inputs):
     """Computes logits by running inputs through a linear layer.

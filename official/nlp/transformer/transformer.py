@@ -26,7 +26,7 @@ from official.nlp.transformer import embedding_layer
 from official.nlp.transformer import ffn_layer
 from official.nlp.transformer import metrics
 from official.nlp.transformer import model_utils
-from official.nlp.transformer.utils.tokenizer import EOS_ID
+# from official.nlp.transformer.utils.tokenizer import EOS_ID
 
 # Disable the not-callable lint error, since it claims many objects are not
 # callable when they actually are.
@@ -73,7 +73,7 @@ class Transformer(tf.keras.Model):
   probabilities for the output sequence.
   """
 
-  def __init__(self, params, name=None):
+  def __init__(self, params, embedding=None, name=None):
     """Initialize layers to build Transformer model.
 
     Args:
@@ -83,7 +83,7 @@ class Transformer(tf.keras.Model):
     super(Transformer, self).__init__(name=name)
     self.params = params
     self.embedding_softmax_layer = embedding_layer.EmbeddingSharedWeights(
-        params["vocab_size"], params["hidden_size"])
+        params["vocab_size"], params["hidden_size"]) if embedding is None else embedding
     self.encoder_stack = EncoderStack(params)
     self.decoder_stack = DecoderStack(params)
     self.position_embedding = position_embedding.RelativePositionEmbedding(
@@ -94,7 +94,7 @@ class Transformer(tf.keras.Model):
         "params": self.params,
     }
 
-  def call(self, inputs, training):
+  def call(self, inputs, training, enc_use_emb=True, enc_emb_mode="embedding", enc_embedded_inputs=None, greedy_search=False):
     """Calculate target logits or inferred target sequences.
 
     Args:
@@ -139,16 +139,16 @@ class Transformer(tf.keras.Model):
 
       # Run the inputs through the encoder layer to map the symbol
       # representations to continuous representations.
-      encoder_outputs = self.encode(inputs, attention_bias, training)
+      encoder_outputs = self.encode(inputs, attention_bias, training, enc_use_emb, enc_emb_mode, enc_embedded_inputs)
       # Generate output sequence if targets is None, or return logits if target
       # sequence is known.
       if targets is None:
-        return self.predict(encoder_outputs, attention_bias, training)
+        return self.predict(encoder_outputs, attention_bias, training, greedy_search)
       else:
         logits = self.decode(targets, encoder_outputs, attention_bias, training)
         return logits
 
-  def encode(self, inputs, attention_bias, training):
+  def encode(self, inputs, attention_bias, training, use_emb=True, emb_mode="embedding", embedded_inputs=None):
     """Generate continuous representation for inputs.
 
     Args:
@@ -162,7 +162,8 @@ class Transformer(tf.keras.Model):
     with tf.name_scope("encode"):
       # Prepare inputs to the layer stack by adding positional encodings and
       # applying dropout.
-      embedded_inputs = self.embedding_softmax_layer(inputs)
+      if use_emb:
+        embedded_inputs = self.embedding_softmax_layer(inputs, mode=emb_mode)
       embedded_inputs = tf.cast(embedded_inputs, self.params["dtype"])
       inputs_padding = model_utils.get_padding(inputs)
       attention_bias = tf.cast(attention_bias, self.params["dtype"])
@@ -201,7 +202,8 @@ class Transformer(tf.keras.Model):
         targets = tf.pad(targets, [[0, 0], [1, 0]])[:, :-1]
       decoder_inputs = self.embedding_softmax_layer(targets)
       decoder_inputs = tf.cast(decoder_inputs, self.params["dtype"])
-      attention_bias = tf.cast(attention_bias, self.params["dtype"])
+      if attention_bias is not None:
+        attention_bias = tf.cast(attention_bias, self.params["dtype"])
       with tf.name_scope("add_pos_encoding"):
         length = tf.shape(decoder_inputs)[1]
         pos_encoding = self.position_embedding(decoder_inputs)
@@ -275,7 +277,7 @@ class Transformer(tf.keras.Model):
 
     return symbols_to_logits_fn
 
-  def predict(self, encoder_outputs, encoder_decoder_attention_bias, training):
+  def predict(self, encoder_outputs, encoder_decoder_attention_bias, training, greedy_search=False):
     """Return predicted sequence."""
     encoder_outputs = tf.cast(encoder_outputs, self.params["dtype"])
     if self.params["padded_decode"]:
@@ -284,7 +286,7 @@ class Transformer(tf.keras.Model):
     else:
       batch_size = tf.shape(encoder_outputs)[0]
       input_length = tf.shape(encoder_outputs)[1]
-    max_decode_length = input_length + self.params["extra_decode_length"]
+    max_decode_length = self.params["max_length"]
     encoder_decoder_attention_bias = tf.cast(encoder_decoder_attention_bias,
                                              self.params["dtype"])
 
@@ -292,7 +294,8 @@ class Transformer(tf.keras.Model):
         max_decode_length, training)
 
     # Create initial set of IDs that will be passed into symbols_to_logits_fn.
-    initial_ids = tf.zeros([batch_size], dtype=tf.int32)
+    BOS_id, EOS_id = self.params["BOS_id"], self.params["EOS_id"]
+    initial_ids = tf.zeros([batch_size], dtype=tf.int32) + BOS_id
 
     # Create cache storing decoder attention values for each layer.
     # pylint: disable=g-complex-comprehension
@@ -318,25 +321,79 @@ class Transformer(tf.keras.Model):
     cache["encoder_outputs"] = encoder_outputs
     cache["encoder_decoder_attention_bias"] = encoder_decoder_attention_bias
 
-    # Use beam search to find the top beam_size sequences and scores.
-    decoded_ids, scores = beam_search.sequence_beam_search(
-        symbols_to_logits_fn=symbols_to_logits_fn,
-        initial_ids=initial_ids,
-        initial_cache=cache,
-        vocab_size=self.params["vocab_size"],
-        beam_size=self.params["beam_size"],
-        alpha=self.params["alpha"],
-        max_decode_length=max_decode_length,
-        eos_id=EOS_ID,
-        padded_decode=self.params["padded_decode"],
-        dtype=self.params["dtype"])
+    if greedy_search:
+      initial_soft_seq = tf.zeros([self.params["vocab_size"]], dtype=self.params["dtype"])
+      initial_soft_seq = tf.tensor_scatter_nd_update(initial_soft_seq, [[BOS_id]], [1])
+      return Transformer.greedy_search(
+          symbols_to_logits_fn=symbols_to_logits_fn,
+          initial_ids=initial_ids,
+          initial_soft_seq=initial_soft_seq,
+          initial_cache=cache,
+          vocab_size=self.params["vocab_size"],
+          max_decode_length=max_decode_length,
+          EOS_id=EOS_id,
+          dtype=self.params["dtype"])
+    else:
+      # Use beam search to find the top beam_size sequences and scores.
+      decoded_ids, scores = beam_search.sequence_beam_search(
+          symbols_to_logits_fn=symbols_to_logits_fn,
+          initial_ids=initial_ids,
+          initial_cache=cache,
+          vocab_size=self.params["vocab_size"],
+          beam_size=self.params["beam_size"],
+          alpha=self.params["alpha"],
+          max_decode_length=max_decode_length,
+          eos_id=EOS_id,
+          padded_decode=self.params["padded_decode"],
+          dtype=self.params["dtype"])
 
-    # Get the top sequence for each batch element
-    top_decoded_ids = decoded_ids[:, 0, 1:]
-    top_scores = scores[:, 0]
+      # Get the top sequence for each batch element
+      top_decoded_ids = decoded_ids[:, 0]
+      top_scores = scores[:, 0]
 
-    return {"outputs": top_decoded_ids, "scores": top_scores}
+      return {"outputs": top_decoded_ids, "scores": top_scores}
+    
+  @staticmethod
+  def greedy_search(
+    symbols_to_logits_fn,
+    initial_ids,
+    initial_soft_seq,
+    initial_cache,
+    vocab_size,
+    max_decode_length,
+    EOS_id,
+    dtype=tf.float32
+    ):
+    batch_size = tf.shape(initial_ids)[0]
+    step = 0
+    seq = tf.expand_dims(initial_ids, -1)  # (batch_size, cur_len)
+    soft_seq = tf.broadcast_to(initial_soft_seq, [batch_size, 1, vocab_size])  # (batch_size, cur_len, vocab_size)
+    cache = initial_cache
+    finished = tf.zeros([batch_size], dtype=tf.bool)
+    while step < max_decode_length - 1 and not tf.math.reduce_all(finished):
+      # Get logits for the next candidate IDs for the sequences. Get the
+      # new cache values at the same time.
+      logits, cache = symbols_to_logits_fn(seq, step, cache)  # logits: (batch_size, vocab_size)
 
+      best_ids = tf.math.argmax(logits, axis=-1, output_type=tf.int32)  # (batch_size)
+      best_ids *= tf.cast(~finished, tf.int32)  # Pad the finished sentences.
+      finished |= tf.equal(best_ids, EOS_id)
+      best_ids = tf.expand_dims(best_ids, -1)  # (batch_size, 1)
+
+      # # Convert logits to normalized probs
+      # # Use softmax to approximate one-hot
+      # b = 10
+      # logits = tf.exp(b * logits)
+      # probs = logits / tf.reduce_sum(logits, axis=-1, keepdims=True)  # (batch_size, vocab_size)
+      # probs = tf.expand_dims(probs, 1)  # (batch_size, 1, vocab_size)
+
+      # Append the most probable IDs to the topk sequences
+      seq = tf.concat([seq, best_ids], axis=1)
+      # soft_seq = tf.concat([soft_seq, probs], axis=1)
+      
+      step += 1
+
+    return seq#, soft_seq
 
 class PrePostProcessingWrapper(tf.keras.layers.Layer):
   """Wrapper class that applies layer pre-processing and post-processing."""
@@ -536,12 +593,13 @@ class DecoderStack(tf.keras.layers.Layer):
               training=training,
               cache=layer_cache,
               decode_loop_step=decode_loop_step)
-        with tf.name_scope("encdec_attention"):
-          decoder_inputs = enc_dec_attention_layer(
-              decoder_inputs,
-              encoder_outputs,
-              attention_bias,
-              training=training)
+        if encoder_outputs is not None:
+          with tf.name_scope("encdec_attention"):
+            decoder_inputs = enc_dec_attention_layer(
+                decoder_inputs,
+                encoder_outputs,
+                attention_bias,
+                training=training)
         with tf.name_scope("ffn"):
           decoder_inputs = feed_forward_network(
               decoder_inputs, training=training)

@@ -51,7 +51,7 @@ BASE_PARAMS = collections.defaultdict(
 
     # Default prediction params
     extra_decode_length=50,
-    beam_size=4,
+    beam_size=1,
     alpha=0.6,  # used to calculate length normalization in beam search
 
     # TPU specific parameters
@@ -91,6 +91,7 @@ TINY_PARAMS.update(
     default_batch_size=1024,
     default_batch_size_tpu=1024,
     hidden_size=32,
+    # num_hidden_layers=2,
     num_heads=4,
     filter_size=256,
 )

@@ -156,7 +156,7 @@ def translate_file(model,
       val_outputs = np.reshape(val_outputs, [params["decode_batch_size"], -1])
     else:
       val_outputs, _ = model.predict(text)
-
+      
     length = len(val_outputs)
     for j in range(length):
       if j + i * batch_size < total_samples:

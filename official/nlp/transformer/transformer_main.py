@@ -172,8 +172,9 @@ class TransformerTask(object):
     params["word_dropout"] = flags_obj.word_dropout
     params["word_blank"] = flags_obj.word_blank
     
-    self.vocab = Dictionary.read_vocab(flags_obj.vocab_file)
-    params["vocab_size"] = len(self.vocab)
+    if flags_obj.task == "ETST":
+      self.vocab = Dictionary.read_vocab(flags_obj.vocab_file)
+      params["vocab_size"] = len(self.vocab)
 
     self.distribution_strategy = distribute_utils.get_distribution_strategy(
         distribution_strategy=flags_obj.distribution_strategy,
