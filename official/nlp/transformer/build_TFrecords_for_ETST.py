@@ -14,6 +14,14 @@
 
 """Download and preprocess WMT17 ende training and evaluation datasets."""
 
+from official.nlp.transformer.utils.others import from_path_import
+
+# from dictionary import Dictionary
+name = "dictionary"
+path = "/home/zchen/encyclopedia-text-style-transfer/dictionary.py"
+demands = ["Dictionary"]
+from_path_import(name, path, globals(), demands)
+
 import os
 import random
 import tarfile
@@ -32,14 +40,6 @@ import tensorflow.compat.v1 as tf
 from official.nlp.transformer.utils import tokenizer
 from official.utils.flags import core as flags_core
 # pylint: enable=g-bad-import-order
-from official.nlp.transformer.utils.others import from_path_import
-
-# from dictionary import Dictionary
-name = "dictionary"
-path = "/home/zchen/encyclopedia-text-style-transfer/dictionary.py"
-demands = ["Dictionary"]
-from_path_import(name, path, globals(), demands)
-
 
 # Strings to inclue in the generated files.
 _PREFIX = ""
